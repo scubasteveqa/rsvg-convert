@@ -1,16 +1,12 @@
 library(shiny)
 library(bslib)
-library(rsvg)  # For SVG processing in R
-library(grDevices)
-library(png)
-library(ggplot2)
-library(svglite)
+library(processx)  # For running external commands
 
 ui <- page_fluid(
-  title = "SVG Conversion in R",
+  title = "SVG Conversion with rsvg-convert",
   
   card(
-    card_header("SVG Converter"),
+    card_header("SVG to PNG Converter"),
     
     fileInput("svg_file", "Upload SVG File", 
               accept = c(".svg"),
@@ -24,15 +20,14 @@ ui <- page_fluid(
     
     selectInput("format", "Output Format",
                 choices = c("PNG" = "png", 
-                           "PDF" = "pdf"),
+                           "PDF" = "pdf", 
+                           "PS" = "ps"),
                 selected = "png"),
-    
-    checkboxInput("add_filter", "Add Simple Filter", value = FALSE),
     
     downloadButton("download", "Convert and Download"),
     
     card_footer(
-      "Uses R packages for SVG conversion"
+      "Uses rsvg-convert command-line tool for SVG conversion"
     )
   ),
   
@@ -41,7 +36,7 @@ ui <- page_fluid(
     actionButton("check_system", "Check if rsvg-convert is installed"),
     verbatimTextOutput("system_check_output"),
     hr(),
-    verbatimTextOutput("status_output")
+    verbatimTextOutput("command_output")
   ),
   
   card(
@@ -51,18 +46,22 @@ ui <- page_fluid(
   
   card(
     card_header("About"),
-    p("This app demonstrates SVG conversion using R packages instead of system commands."),
-    p("The app uses the 'rsvg' and 'svglite' packages to process SVG files."),
-    p("This version works on posit.cloud without requiring external system commands."),
-    p("You can check if rsvg-convert is available on your system using the system check button.")
+    p("This app demonstrates the use of rsvg-convert command-line tool for SVG conversion."),
+    p("Note: This app requires rsvg-convert to be installed on your system."),
+    p("You can check if it's available by clicking the 'Check if rsvg-convert is installed' button.")
   )
 )
 
 server <- function(input, output, session) {
   
-  # Check if required packages are available
-  packages_available <- reactive({
-    all(c("rsvg", "png", "svglite") %in% installed.packages()[,"Package"])
+  # Check if rsvg-convert is available
+  command_available <- reactive({
+    tryCatch({
+      result <- system2("which", "rsvg-convert", stdout = TRUE, stderr = TRUE)
+      return(!is.null(result) && length(result) > 0 && !any(grepl("not found", result, ignore.case = TRUE)))
+    }, error = function(e) {
+      return(FALSE)
+    })
   })
   
   # Function to check if rsvg-convert is installed
@@ -98,6 +97,19 @@ server <- function(input, output, session) {
     path_env <- Sys.getenv("PATH")
     results[["PATH"]] <- path_env
     
+    # Try to locate rsvg-convert manually in common locations
+    common_locations <- c(
+      "/usr/bin/rsvg-convert",
+      "/usr/local/bin/rsvg-convert",
+      "/opt/homebrew/bin/rsvg-convert",
+      "C:/Program Files/rsvg-convert/rsvg-convert.exe"
+    )
+    
+    for (location in common_locations) {
+      results[[paste("File exists:", location)]] <- 
+        if (file.exists(location)) "YES" else "NO"
+    }
+    
     return(results)
   }
   
@@ -122,74 +134,35 @@ server <- function(input, output, session) {
     output$system_check_output <- renderText({ output_text })
   })
   
-  # Process SVG content (add filter if requested)
-  process_svg <- function(svg_path) {
-    if (!input$add_filter) {
-      return(svg_path)  # Skip processing if disabled
+  # Convert SVG to target format using rsvg-convert command
+  convert_svg <- function(svg_path, output_path, format, width, height) {
+    # Check if rsvg-convert is available
+    if (!command_available()) {
+      stop("rsvg-convert is not available on this system")
     }
     
-    # Create a temporary file for the processed SVG
-    processed_path <- tempfile(fileext = ".svg")
+    # Use rsvg-convert via processx
+    args <- c(
+      "-f", format,
+      "-w", width,
+      "-h", height,
+      "-o", output_path,
+      svg_path
+    )
     
-    tryCatch({
-      # Read SVG content
-      svg_content <- readLines(svg_path)
-      
-      # Add a simple filter definition after the opening SVG tag
-      svg_tag_index <- grep("<svg", svg_content)[1]
-      if (!is.na(svg_tag_index)) {
-        # Simple blue tint filter
-        filter_def <- c(
-          "<defs>",
-          "  <filter id=\"blue-tint\">",
-          "    <feColorMatrix type=\"matrix\" values=\"0.9 0 0 0 0 0 0.9 0 0 0 0 0 1.2 0 0 0 0 0 1 0\"/>",
-          "  </filter>",
-          "</defs>"
-        )
-        
-        # Apply filter to the SVG content
-        svg_content <- c(
-          svg_content[1:svg_tag_index],
-          filter_def,
-          # Modify the root group to use the filter
-          gsub("<g", "<g filter=\"url(#blue-tint)\"", svg_content[(svg_tag_index+1):length(svg_content)], fixed = FALSE)
-        )
-        
-        # Write modified content back
-        writeLines(svg_content, processed_path)
-        return(processed_path)
-      } else {
-        # If no SVG tag found, return original
-        return(svg_path)
-      }
+    # Log the command
+    command_log <- paste("Running: rsvg-convert", paste(args, collapse = " "))
+    output$command_output <- renderText({ command_log })
+    
+    # Run the command
+    result <- tryCatch({
+      processx::run("rsvg-convert", args, error_on_status = FALSE)
     }, error = function(e) {
-      # If modification fails, just use the original
-      return(svg_path)
+      return(list(status = 1, stderr = paste("Error executing rsvg-convert:", e$message)))
     })
-  }
-  
-  # Convert SVG to target format using R packages
-  convert_svg <- function(svg_path, output_path, format, width, height) {
-    # Process SVG with simple filter if enabled
-    processed_svg <- process_svg(svg_path)
     
-    # Convert SVG to the target format
-    if (format == "png") {
-      tryCatch({
-        # Use rsvg package to convert SVG to PNG
-        rsvg::rsvg_png(processed_svg, output_path, width = width, height = height)
-      }, error = function(e) {
-        stop("Error converting to PNG: ", e$message)
-      })
-    } else if (format == "pdf") {
-      tryCatch({
-        # Use rsvg package to convert SVG to PDF
-        rsvg::rsvg_pdf(processed_svg, output_path, width = width/72, height = height/72)
-      }, error = function(e) {
-        stop("Error converting to PDF: ", e$message)
-      })
-    } else {
-      stop("Unsupported output format: ", format)
+    if(result$status != 0) {
+      stop("Error converting SVG: ", result$stderr)
     }
     
     return(output_path)
@@ -201,16 +174,12 @@ server <- function(input, output, session) {
     input$svg_file$datapath
   })
   
-  # Status output
-  output$status_output <- renderText({
-    if (!packages_available()) {
-      return("Warning: Required packages (rsvg, png, svglite) are not all installed. Please install them with install.packages().")
+  # Command output log
+  output$command_output <- renderText({
+    if (!command_available()) {
+      return("Warning: rsvg-convert command is not available on this system. This app may not function properly.")
     } else {
-      if (!is.null(input$svg_file)) {
-        return(paste("Processing file:", input$svg_file$name))
-      } else {
-        return("System is ready. Upload an SVG file to convert.")
-      }
+      return("System is ready. Upload an SVG file to convert.")
     }
   })
   
